@@ -1,0 +1,945 @@
+#!/bin/bash
+#
+# Cryptography utility made for a class in Network Security and Management.
+# Copyright (C) 2012, Helder Correia
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+
+# Use Xdialog by default (you can override with: export DIALOG=dialog; ./criptoSGR)
+: ${DIALOG=Xdialog}
+
+# Comment the next line if you don't want to fallback to dialog when Xdialog isn't available.
+type -P Xdialog &> /dev/null || { echo "Xdialog was not found so will try dialog instead."; DIALOG="dialog"; }
+
+# Global variables
+PROG_NAME=$(basename $0)
+BACKTITLE="$PROG_NAME: Cryptography utility"
+DEFAULT_DIR="$PWD/"
+OUTPUT_DIR="$DEFAULT_DIR"
+PRIVATE_KEY=""
+
+OPTION_KEYPAIRS="Create pair of asymmetric keys"
+OPTION_ENCRYPT="Encrypt message with symmetric cipher"
+OPTION_DISTRIBUTE="Distribute symmetric key"
+OPTION_DECRYPT="Decrypt message with symmetric cipher"
+OPTION_CHECKSUM="Create secure cryptographic digest"
+OPTION_SIGNATURE="Create digital signature"
+OPTION_VERIFY_SIG="Verify digital signature"
+OPTION_VERIFY_CHECKSUM="Verify secure cryptographic checksum"
+OPTION_SETTINGS="Settings"
+
+# Command line error handling
+_error() {
+    echo "$PROG_NAME: $1" >&2
+}
+_abort() {
+    _error "$1" && exit 1
+}
+
+# Check if (X)dialog is available
+type -P $DIALOG &> /dev/null || _abort "${DIALOG} utility not found. Please install and try again."
+
+# Check if openssl is available
+type -P openssl &> /dev/null || _abort "It appears you don't have openssl. Please install and try again."
+
+
+######################################
+###   Temporary files management   ###
+######################################
+#
+# /tmp is potencially accessible to any user that has access to
+# the machine so we'll store our temporaries in the current
+# directory which is more convenient.
+#
+
+# Sends to stdout the contents of a (temporary) file and deletes it.
+#
+# Example usage: FILE=`read_temp file.$$`
+#
+# Arguments:
+#   1 - File path
+#
+read_temp() {
+    echo `cat $1` && rm -f "$1"
+}
+
+# Deletes all temporary files used by this process.
+delete_temp() {
+    rm -f *.$$
+}
+
+# Remove any leftover temporary files on EXIT
+trap 'delete_temp' EXIT
+
+
+#########################################
+###   Helper functions to (X)dialog   ###
+#########################################
+#
+# These functions help reduce some of the duplication
+# in handling with (X)dialog widgets.
+#
+
+# Shows a msgbox widget where the user must press OK to move on.
+#
+# Arguments:
+#   1 - Message to display
+#   2 - Window title (optional)
+#
+alert() {
+    $DIALOG --backtitle "$BACKTITLE" \
+            --title "${2:-$PROG_NAME}" \
+            --msgbox "$1" 0 0
+}
+
+# Shows a textbox widget with the contents of a file.
+#
+# Arguments:
+#   1 - File with contents to display
+#   2 - Window title (optional)
+#
+show_text() {
+    if [ -s "$1" ]; then
+        $DIALOG --backtitle "$BACKTITLE" \
+                --title "${2:-$PROG_NAME}" \
+                --textbox "$1" 0 0
+    fi
+}
+
+# Shows a directory selection (dselect) widget.
+#
+# Choice is saved inside dir.$$
+#
+# Arguments:
+#   1 - Window title (optional)
+#
+select_dir() {
+    $DIALOG --backtitle "$BACKTITLE" \
+            --title "${1:-Please choose a directory}" \
+            --dselect "$DEFAULT_DIR" 0 0 2> dir.$$
+}
+
+# Outputs the directory path chosen with select_dir, after
+# ensuring that it exists first.
+#
+# Result will include a trailing slash.
+#
+get_dir() {
+    # Remove trailing slash here to add it afterwards
+    local dir=`read_temp dir.$$ | sed -e "s/\/*$//"`
+
+    # Make sure it exists
+    mkdir -p "$dir"
+
+    if [ -d "$dir" ]; then
+        DEFAULT_DIR="$dir/"
+        # Add the trailing slash here because if for some reason
+        # $dir is empty, it will default to the current directory
+        # where this is needed.
+        echo "$dir/"
+    fi
+}
+
+# Shows a file selection (fselect) widget.
+#
+# Choice is saved inside file.$$
+#
+# Arguments:
+#   1 - Window title for select widget (optional)
+#
+select_file() {
+    $DIALOG --backtitle "$BACKTITLE" \
+            --title "${1:-Please choose a file}" \
+            --fselect "$DEFAULT_DIR" 0 0 2> file.$$
+}
+
+# Ensures a valid non empty file is chosen with select_file.
+#
+# Choice is saved inside file.$$
+#
+# Arguments:
+#   1 - Valid file path or window title for select widget (optional)
+#   2 - Error message in case the file isn't a valid one (optional)
+#
+ensure_file() {
+    # If we get a file path as first argument and it's a valid
+    # non-empty regular file, use it.
+    if [ -f "$1" ] && [ -s "$1" ]; then
+        echo -n "$1" > file.$$
+        return
+    fi
+    # Otherwise, ask for a file.
+    while :; do
+        select_file "${1:-Choose your file}" || return
+        local file=`cat file.$$`
+
+        if [ -f "$file" ] && [ -s "$file" ]; then
+            break
+        fi
+
+        alert "${2:-\"$file\" is not a valid file.}"
+    done
+}
+
+# Sets the path to a private key in the global variable PRIVATE_KEY.
+#
+# Path is saved inside file.$$
+#
+# Usually you only use your own private key, so we should make this
+# a setting and avoid asking the user to select it every time.
+#
+# Arguments:
+#   1 - Window title for the select file widget (optional)
+#
+set_private_key() {
+    # Make sure we have a valid private key
+    while :; do
+        ensure_file "${1:-Your private key}" || return
+
+        # Verify private key
+        openssl rsa -text -noout -in "`cat file.$$`" &> /dev/null
+
+        [ $? -eq 0 ] && break
+
+        alert "The key you provided is not a valid private key."
+    done
+
+    alert "Private key set to `cat file.$$`."
+}
+
+# Checks if the private key is set in the global variable PRIVATE_KEY.
+#
+# Use this at the top of any function that needs the private key,
+# and return if not successful. The user will be alerted to set his
+# key in settings.
+#
+# Example:
+#   check_private_key || return
+#
+check_private_key() {
+    if [ -z "$PRIVATE_KEY" ]; then
+        alert "Please set your private key in settings."
+        return 1
+    fi
+}
+
+# Makes sure we get a valid public key
+#
+# Path is saved inside file.$$
+#
+# Arguments:
+#   1 - Window title for the select file widget (optional)
+#
+get_public_key() {
+    while :; do
+        ensure_file "${1:-Public key of the receiver}" || return
+
+        # Verify public key
+        openssl rsa -text -noout -pubin -in "`cat file.$$`" &> /dev/null
+
+        [ $? -eq 0 ] && break
+
+        alert "The key you provided is not a valid public key."
+    done
+}
+
+# Shows an inputbox widget.
+#
+# Input is saved inside name.$$
+#
+# Arguments:
+#   1 - Window title (optional)
+#   2 - Text to show to the user above the input field (optional)
+#
+input() {
+    $DIALOG --backtitle "$BACKTITLE" \
+            --title "${1:-$PROG_NAME}" \
+            --inputbox "${2:-Choose a name}" 0 0 2> name.$$
+}
+
+# Shows a passwordbox widget.
+#
+# Similar to input() but with characters obfuscated.
+#
+# Input is saved inside key.$$
+#
+# Arguments:
+#   1 - Window title (optional)
+#   2 - Text to show to the user above the input field (optional)
+#
+input_key() {
+    $DIALOG --backtitle "$BACKTITLE" \
+            --title "${1:-$PROG_NAME}" \
+            --passwordbox "${2:-Insert your secret key}" 0 0 2> key.$$
+
+    # Xdialog adds a byte to the output of this widget even if
+    # the contents are empty which makes it more difficult to
+    # validate if a password was entered with `[ -s key.$$ ]`.
+    #
+    # It's probably because of the "Hide typing" flag and
+    # that's why we need this extra step.
+
+    local retval=$?
+
+    if [ "$DIALOG" = "Xdialog" ] && [ "`stat -c%s key.$$`" = "1" ]; then
+        rm -f key.$$
+    fi
+
+    return $retval
+}
+
+# Make sure we have a valid non-empty symmetric key.
+#
+# We can provide a second argument with a key and reuse this
+# validation to ask for another key if it isn't valid.
+#
+# Arguments:
+#   1 - Window title (optional, shows only when no key is provided)
+#   2 - Key to use (optional, asks for one if not present or isn't valid)
+#
+ensure_key() {
+    echo -n "$2" > key.$$
+    until [ -s key.$$ ]; do
+        input_key "${1:-$PROG_NAME}" || return
+    done
+}
+
+# Shows a menu widget with private key sizes in bits.
+#
+# Result is saved inside bits.$$
+
+# As of 2003, RSA claims that 1024-bit keys are likely to become crackable some
+# time between 2006 and 2010 and that 2048-bit keys are sufficient until 2030.
+# See http://www.rsa.com/rsalabs/node.asp?id=2004 for more details.
+#
+# Arguments:
+#   1 - Window title (optional, defaults to $PROG_NAME)
+#   2 - Text to show to the user above the options (optional)
+#
+select_numbits() {
+    $DIALOG --backtitle "$BACKTITLE" \
+            --title "${1:-$PROG_NAME}" \
+            --menu "${2:-Choose the size of the private key to generate in bits.}" 20 80 4 \
+            "1024" "common, but no longer recommended" \
+            "2048" "recommended" \
+            "3072" "more secure" \
+            "4096" "most secure" 2> bits.$$
+}
+
+# Shows a menu widget with cipher choices.
+#
+# Result is saved inside cipher.$$
+#
+# Arguments:
+#   1 - Window title (optional)
+#   2 - Text to show to the user above the options (optional)
+#
+select_cipher() {
+    $DIALOG --backtitle "$BACKTITLE" \
+            --title "${1:-$PROG_NAME}" \
+            --menu "${2:-Choose an encryption algorithm.}" 20 80 4 \
+            "des" "Data Encryption Standard. Considered vulnerable." \
+            "des3" "A tripple application of DES." \
+            "blowfish" "Replacement for DES. More secure." \
+            "aes256" "Advanced Encryption Standard. Very Secure." 2> cipher.$$
+}
+
+# Shows a menu widget with hash function choices.
+#
+# Result is saved inside hash.$$
+#
+# We have some cryptanalysis research results that show that MD5
+# can have many collisions and even SHA-1 was shown to not be
+# collision-free also, i.e., an algorithm was developed for finding
+# collisions faster than brute force.
+#
+# That's why only SHA224 and above are recommended hash algorithms.
+#
+# You can read more at:
+#   - http://eprint.iacr.org/2004/199.pdf
+#   - http://www.schneier.com/blog/archives/2005/02/cryptanalysis_o.html
+#
+select_hash() {
+    $DIALOG --backtitle "$BACKTITLE" \
+            --title "${1:-$PROG_NAME}" \
+            --menu "${2:-Choose an hash algorithm.}" 20 80 6 \
+            "md5" "MD5 Digest (128 bits, not recommended)" \
+            "sha1" "SHA-1 Digest (160 bits)" \
+            "sha224" "SHA-224 Digest (recommended or above)" \
+            "sha256" "SHA-256 Digest" \
+            "sha384" "SHA-384 Digest" \
+            "sha512" "SHA-512 Digest" 2> hash.$$
+}
+
+# Shows a menu widget with a MAC or HMAC choice.
+#
+# Result is saved inside mac.$$
+#
+select_mac() {
+    $DIALOG --backtitle "$BACKTITLE" \
+            --title "${1:-$PROG_NAME}" \
+            --menu "${2:-Choose a cryptographic checksum algorithm.}" 20 50 2 \
+            "mac" "Message Authentication Code" \
+            "hmac" "Hash-based MAC" 2> mac.$$
+}
+
+
+# Checks the successfulness of a command and alert possible error.
+#
+# This can be used just after running a command with
+# output to debug.$$.
+#
+# If the last command wasn't successful, show an optional
+# error message, or the error that was output from that command.
+# Otherwise, an optional success message is shown.
+#
+# Arguments:
+#   1 - Message for the user in case of success (optional)
+#
+verify() {
+    local retval=$?
+
+    # Was the last command not a success?
+    if [ $retval -ne 0 ]; then
+        # Showing the error from openssl isn't the most user friendly
+        # way but since there could be many reasons for it to go wrong
+        # this is actually the most practical.
+        if [ -s debug.$$ ]; then
+            show_text debug.$$ "ERROR"
+        fi
+
+        # We return the code from the last command so we can do:
+        # verify || return (and exit to main menu right away)
+        return $retval
+    fi
+
+    # Syntax sugar:
+    #   verify "Success message." || return
+    #
+    # Which is short for:
+    #   verify || return
+    #   alert "Success message."
+    #
+    # Do not show success message if output suppression is on.
+    #
+    if [ "$1" -a ! -f suppress.$$ ]; then
+        alert "$1"
+    fi
+}
+
+# Save argument to be used later when output suppression is on.
+#
+# Some options may want to supress output to the user and just
+# get the results (e.g. verify_checksum).
+#
+# Just need to create the file suppress.$$ to do this.
+# If a second argument is provided, we save it to suppress.$$
+# usually it's the path to some path we'll need later.
+#
+# Arguments:
+#   1 - Default value to be used
+#   2 - Alternate value in case output suppression is on (optional)
+#
+suppress() {
+    if [ "$2" -a -f suppress.$$ ]; then
+        echo -n "$2" > suppress.$$
+        echo "$2"
+    else
+        echo "$1"
+    fi
+}
+
+# The `openssl dgst` command for cryptographic digests adds
+# some metadata. The worst of which is the path to the file
+# used to build the digest. Because of this, we can't use this
+# output to make another digest and verify integrity because
+# the source files, or at least their pahts, are likely to
+# be different.
+#
+# This is why we need to filter that metadata out.
+#
+# Arguments:
+#   1 - Path to file with the digest generated by opnessl
+#
+filter_digest() {
+    cat "$1" | awk '{print $2}' > dgst.$$
+    mv dgst.$$ "$1"
+}
+
+# Save out.$$ to another file.
+#
+# Sometimes it's useful to save output to out.$$ or another
+# temporary, until later. This way, if there's some problem
+# and the process is interrupted, temporary files are
+# cleaned up and we stay clear of trash.
+#
+# Arguments:
+#   1 - Resulting file
+#   2 - File to save from (optional, defaults to out.$$)
+#
+save_to() {
+    mv "${2:-out.$$}" "$1" &> debug.$$ && verify
+}
+
+
+########################
+###   Menu Options   ###
+########################
+#
+# This is the main part of the script, where the main menu
+# options are executed. Each function represents an option.
+#
+# It's assumed that if the user hits a cancel button, he
+# returns to the main menu. dialog doesn't have a --wizard
+# option, so this is the easiest thing to do. The user can
+# then re-select the same option and start over.
+#
+# Wherever possible, we try to make sure an acceptable input
+# is given to minimize the chances that the process will fail
+# and the user has to start all over again.
+#
+
+# Create pair of asymmetric keys
+key_pairs() {
+    while :
+    do
+        input "$OPTION_KEYPAIRS" \
+              "Choose a name for the key.\n\n"`
+             `"It will be used as a prefix for the file names "`
+             `"where the keys will be stored." || return
+
+        local name=`read_temp name.$$`
+
+        # Filter out spaces from input
+        name=${name//[[:space:]]}
+
+        # Make sure we have a non empty name
+        if [ "$name" ]; then
+            local dest_pvt="${OUTPUT_DIR}${name}_PrKey_RSA.pem"
+            local dest_pub="${OUTPUT_DIR}${name}_PubKey_RSA.pem"
+
+            select_numbits "$OPTION_KEYPAIRS" || return
+            local num_bits=`read_temp bits.$$`
+
+            # generate key pairs
+            openssl genrsa -out "$dest_pvt" $num_bits &> debug.$$
+            verify || return
+
+            # extract public key from key pairs
+            openssl rsa -in "$dest_pvt" -pubout -out "$dest_pub" &> debug.$$
+            verify "Your private key ($(basename $dest_pvt)) and public key ($(basename $dest_pub)) were generated to $OUTPUT_DIR ($num_bits bits)."
+
+            return
+        fi
+    done
+}
+
+# Encrypt message with symmetric cipher.
+#
+# We need:
+#  - a file with a message
+#  - shared key (symmetric)
+#  - cipher to use
+#
+# Arguments:
+#   1 - Path to file with plaintext message (optional)
+#   2 - Secret key (symmetric, optional)
+#   3 - Cipher (as accepted by openssl enc, optional)
+#   4 - Cryptogram description (optional, used in confirmation message to the user)
+#
+encrypt() {
+    # Make sure the plaintext message to encrypt is non-empty
+    ensure_file "${1:-Which file do you want to encrypt?}" || return
+    local file=`read_temp file.$$`
+    local base=$(basename $file)
+
+    # Save output to temporary file is output suppression is on
+    local out=`suppress "${OUTPUT_DIR}${base%.*}.enc" enc.$$`
+
+    # Make sure we have a valid non-empty key
+    ensure_key "$OPTION_ENCRYPT" "$2" || return
+
+    # Get cipher
+    if [ "$3" ]; then
+        local cipher="$3"
+    else
+        select_cipher "$OPTION_ENCRYPT" || return
+        local cipher=`read_temp cipher.$$`
+    fi
+
+    # Save cryptogram to $out
+    # Note, using -nosalt because of MAC verification
+    openssl enc -$cipher -a -nosalt -in "$file" -out "$out" -pass file:key.$$ &> debug.$$
+    verify "Your ${4:-cryptogram} was saved to \"$out\"."
+}
+
+# Distribute symmetric key.
+#
+# To decrypt a message encrypted with a shared key (symmetric),
+# we need to send the other user that key. To ensure confidentiality,
+# we can use the receiver's public key (asymmetric) to encrypt the
+# shared key.
+#
+# Also, to ensure authenticity we make a cryptographic checksum of the key
+# to send along with the encrypted key.
+#
+# We need:
+#  - shared key (symmetric)
+#  - public key of the receiver (asymmetric)
+#  - any data needed for the cryptographic checksum (see checksum func)
+#
+distribute() {
+    # Make sure the user enters a valid non-empty key
+    ensure_key "$OPTION_DISTRIBUTE" || return
+
+    # Get public key of the receiver
+    get_public_key || return
+    local receiver=`read_temp file.$$`
+
+    # Let the user choose the resulting file name
+    until [ -s name.$$ ]; do
+        input "$OPTION_DISTRIBUTE" \
+              "Choose a name for the file where the encrypted "`
+             `"key will be stored." || return
+    done
+
+    local name=`read_temp name.$$`
+    local out="${OUTPUT_DIR}${name}.enc"
+
+    # Save the encrypted shared key to $out
+    openssl rsautl -encrypt -in key.$$ -pubin -inkey "$receiver" -out "$out" &> debug.$$
+    verify "Your encrypted key was saved to \"$out\"." || return
+
+    # Rename file with key to reuse "$name" later
+    local tmp="${OUTPUT_DIR}$name.t$$"
+    mv key.$$ "$tmp"
+
+    # Generate cryptographic checksum
+    checksum $tmp "`cat "$tmp"`"
+    rm $tmp
+}
+
+# Decrypt message with symmetric cipher
+#
+# After receiving the shared key in an encrypted message we can
+# use the private key of the receiver to get the shared key in
+# plaintext and use it to finally decrypt the message.
+#
+# We need:
+#  - message cryptogram
+#  - shared key cryptogram (symmetric, encrypted with asymmetric)
+#  - private key of the receiver (asymmetric)
+#  - cipher used to encrypt message
+#
+decrypt() {
+    check_private_key || return
+
+    ensure_file "File with encrypted message" || return
+    local crypto=`read_temp file.$$`
+
+    alert "Note that you should have a MAC/HMAC to verify authenticity of the symmetric key.\n"`
+         `"Use the '$OPTION_VERIFY_CHECKSUM' option to confirm it's trusted."
+
+    ensure_file "File with the symmetric key" || return
+    local enc_key=`read_temp file.$$`
+
+    # Decrypt shared key
+    openssl rsautl -decrypt -in "$enc_key" -inkey "$PRIVATE_KEY" -out key.$$ &> debug.$$
+    verify || return
+
+    # Get cipher
+    select_cipher "$OPTION_DECRYPT" "Select the cipher used in encrypting the cryptogram." || return
+    local cipher=`read_temp cipher.$$`
+
+    # Decrypt message
+    openssl enc -d -$cipher -a -in "$crypto" -out out.$$ -pass file:key.$$ &> debug.$$
+    verify || return
+
+    # Show plaintext message
+    show_text out.$$ "Here's your decrypted message"
+}
+
+# Create a cryptographic checksum (MAC or HMAC) for a message.
+#
+# We need:
+#  - Is it MAC or HMAC?
+#  - Hash function
+#  - Message (any file, really)
+#  - Symmetric key
+#  - Ek function in the case of MAC
+#
+# Arguments:
+#   1 - File to checksum (optional, ask user otherwise)
+#   2 - Symmetric key (optional, ask user otherwise)
+#
+checksum() {
+    select_mac "$OPTION_CHECKSUM" || return
+    local mac=`read_temp mac.$$`
+
+    select_hash "$OPTION_CHECKSUM" || return
+    local hash=`read_temp hash.$$`
+
+    ensure_file "$1" || return
+    local input=`read_temp file.$$`
+
+    # Use temporary file if output suppression is on
+    local out=`suppress "${input%.*}_${mac}.hex" check.$$`
+
+    ensure_key "$OPTION_CHECKSUM" "$2" || return
+    local key=`read_temp key.$$`
+
+    # execute _mac() or _hmac()
+    eval "_$mac" "$hash" "$out" "$input" "$key"
+
+    # If output is not suppressed, then this option was selected
+    # from the main menu.
+    #
+    if [ ! -f suppress.$$ ]; then
+
+        # Create .info file with information about this MAC/HMAC
+        #
+        # Format sintax:
+        #   <mac/hmac>[-<cipher>]-<hash>(<file MAC/HMAC was calculated from>)
+        #   <MAC/HMAC result>
+        #
+        if [ -f out.$$ ]; then
+            echo -n "$mac" > info.$$
+
+            if [ "$mac" = "mac" -a -f cipher.$$ ]; then
+                echo -n "-`cat cipher.$$`" >> info.$$
+            fi
+
+            echo "-$hash: $input" >> info.$$
+            cat out.$$ >> info.$$
+
+            save_to ${out%.*}.info info.$$ \
+                && alert "The file ${out%.*}.info was also created with the "`
+                        `"information you were just provided."
+        fi
+
+        alert "Don't forget to prepare your key for distribution, "`
+             `"before you forget it!"
+    fi
+}
+
+# Create a MAC (Message Authentication Code).
+#
+# MAC = Ek(H(M))
+#
+# Arguments:
+#   1 - Hash function
+#   2 - Output file
+#   3 - Input file
+#   4 - Symmetric key
+#
+_mac() {
+    # Generate digest
+    openssl dgst -"$1" -out "$2" "$3" &> debug.$$
+    verify || return
+
+    # Remove metadata left by openssl
+    filter_digest "$2"
+
+    # Encrypt the digest
+    select_cipher || return
+    local cipher=`cat cipher.$$`
+    encrypt "$2" "$4" "$cipher" "MAC (using $1 hash function with $cipher cipher)"
+
+    # Cleanup digest. We only need Ek.
+    rm "$2"
+
+    # We can use out.$$ later (see checksum)
+    if [ -f suppress.$$ ]; then
+        cp `cat suppress.$$` out.$$ &> debug.$$
+    else
+        # The encrypt function generates a file with the same
+        # name as output ($2), but with the extension .enc
+        cp "${2%.*}.enc" out.$$ &> debug.$$
+    fi
+}
+
+# Ceate an HMAC (Hash-based MAC).
+#
+# HMAC = H(M||K)
+#
+# Arguments:
+#   1 - Hash function
+#   2 - Output file
+#   3 - Input file
+#   4 - Symmetric key
+#
+_hmac() {
+    # Generate digest
+    openssl dgst -"$1" -out "$2" -hmac "$4" "$3" &> debug.$$
+    verify "Your HMAC (using $1 hash function) was saved to \"$2\"" || return
+
+    # Remove metadata left by openssl
+    filter_digest "$2"
+
+    # We can use out.$$ later (see checksum)
+    cp "$2" out.$$
+}
+
+# Create a digital signature from a file
+#
+# We need:
+#  - file to sign
+#  - private key
+#  - hash function
+#
+signature() {
+    check_private_key || return
+
+    ensure_file "Which file do you want to sign?" || return
+    local input=`read_temp file.$$`
+    local out="${input%.*}.sign"
+
+    select_hash "$OPTION_SIGNATURE" || return
+    local hash=`read_temp hash.$$`
+
+    openssl dgst -$hash -sign "$PRIVATE_KEY" -out "$out" "$input" &> debug.$$
+    verify "Your digital signature was saved to $out using the $hash hash function."
+}
+
+# Verify digital signature.
+#
+# We need:
+#  - file used to sign
+#  - signature file
+#  - public key
+#  - hash function
+#
+verify_signature() {
+    ensure_file "File used to sign" || return
+    local input=`read_temp file.$$`
+
+    ensure_file "Signature" || return
+    local signature=`read_temp file.$$`
+
+    get_public_key "Public key of the one who signed" || return
+    local pubkey=`read_temp file.$$`
+
+    select_hash "$OPTION_VERIFY_SIG" || return
+    local hash=`read_temp hash.$$`
+
+    openssl dgst -$hash -verify "$pubkey" -signature "$signature" "$input" &> debug.$$
+    verify "The signature $signature is valid."
+}
+
+# Verify cryptographic checksum.
+#
+# We need the same things when creating one.
+# In the end e compare and validate if they're the same.
+#
+# @see checksum()
+#
+verify_checksum() {
+    # Suppress output from other commands. We just need the results.
+    touch suppress.$$
+
+    ensure_file "Cryptographic checksum file (MAC or HMAC)" || return
+    local orig=`read_temp file.$$`
+
+    alert "Now you'll need to provide all the data to reproduce the MAC/HMAC.\n"`
+         `"If you have an .info file, consult it."
+
+    checksum || return
+    local new=`cat suppress.$$`
+
+    cmp -s "$orig" "$new" \
+        && alert "The cryptographic checksum in $orig is valid." \
+        || alert "The cryptographic checksum in $orig is NOT valid."
+}
+
+# Set some global settings that will be available for the remainder of the session.
+#
+# Try to minimize asking the user for data while keeping flexibility.
+# Use the settings option to set common inputs.
+#
+settings() {
+    $DIALOG --backtitle "$BACKTITLE" \
+            --title "$OPTION_SETTINGS" \
+            --menu "These settings will be remembered for the remainder of this session." 20 60 3 \
+            "1" "Change output directory" \
+            "2" "Set your private key" 2> setting.$$
+
+    local retval=$?
+    local setting=`read_temp setting.$$`
+
+    if [ $? -eq 0 ]; then
+        case $setting in
+
+            1)  # Change output directory
+                select_dir "Current dir: $OUTPUT_DIR" || return
+                OUTPUT_DIR=`get_dir`
+                ;;
+
+            2)  # Set private key
+                set_private_key || return
+                PRIVATE_KEY=`read_temp file.$$`
+                ;;
+        esac
+    fi
+}
+
+
+#####################
+###   Main Menu   ###
+#####################
+#
+# After executing each option, the user returns to the main menu.
+#
+while :
+do
+    $DIALOG --clear \
+            --backtitle "$BACKTITLE" \
+            --title "Main Menu" \
+            --menu "What do you want to do?" 25 60 9 \
+            "1" "$OPTION_KEYPAIRS" \
+            "2" "$OPTION_ENCRYPT" \
+            "3" "$OPTION_DISTRIBUTE" \
+            "4" "$OPTION_DECRYPT" \
+            "5" "$OPTION_CHECKSUM" \
+            "6" "$OPTION_SIGNATURE" \
+            "7" "$OPTION_VERIFY_SIG" \
+            "8" "$OPTION_VERIFY_CHECKSUM" \
+            "9" "$OPTION_SETTINGS" 2> menuchoice.$$
+
+    retval=$?
+    choice=`read_temp menuchoice.$$`
+
+    case $retval in
+        0) case $choice in
+
+            1) key_pairs ;;
+            2) encrypt ;;
+            3) distribute ;;
+            4) decrypt ;;
+            5) checksum ;;
+            6) signature ;;
+            7) verify_signature ;;
+            8) verify_checksum ;;
+            9) settings ;;
+
+           esac ;;
+
+        *) clear; exit 0 ;;
+    esac
+
+    # Clean all remaining temporary files
+    # before going for another round.
+    delete_temp
+done
